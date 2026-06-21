@@ -382,6 +382,53 @@ class RTCApp:
         """Returns the peer connection object for the controller client, if it exists."""
         return next((obj for obj in self.peer_connections.values() if obj.get("client_type") == ClientType.CONTROLLER), None)
 
+    def should_accept_input(self, client_peer_id: str) -> bool:
+        """Returns true only for the current controller peer."""
+        peer_obj = self.peer_connections.get(client_peer_id)
+        return bool(peer_obj and peer_obj.get("client_type") == ClientType.CONTROLLER)
+
+    async def handle_input_data_message(self, msg: Any, client_peer_id: str):
+        """Accept input data-channel messages only from the controller peer."""
+        peer_obj = self.peer_connections.get(client_peer_id)
+        client_type = peer_obj.get("client_type") if peer_obj else None
+        if not self.should_accept_input(client_peer_id):
+            logger.info(
+                "dropping input data-channel message from non-controller peer",
+                extra={'client_peer_id': client_peer_id, 'client_type': client_type}
+            )
+            return
+        await self.on_data_message(msg)
+
+    def get_shinto_stats_snapshot(self) -> Dict[str, Any]:
+        """Returns bounded connection statistics without peer IDs or SDP/ICE payloads."""
+        connection_states: Dict[str, int] = {}
+        data_channel_states: Dict[str, int] = {}
+        controller_present = False
+        viewer_count = 0
+
+        for peer_obj in self.peer_connections.values():
+            client_type = peer_obj.get("client_type")
+            if client_type == ClientType.CONTROLLER:
+                controller_present = True
+            elif client_type == ClientType.VIEWER:
+                viewer_count += 1
+
+            peer_conn = peer_obj.get("peer_conn")
+            conn_state = getattr(peer_conn, "connectionState", "unknown") or "unknown"
+            connection_states[conn_state] = connection_states.get(conn_state, 0) + 1
+
+            data_channel = peer_obj.get("data_channel")
+            dc_state = getattr(data_channel, "readyState", "unknown") or "unknown"
+            data_channel_states[dc_state] = data_channel_states.get(dc_state, 0) + 1
+
+        return {
+            "controller_present": controller_present,
+            "peer_count": len(self.peer_connections),
+            "viewer_count": viewer_count,
+            "connection_states": connection_states,
+            "data_channel_states": data_channel_states,
+        }
+
     def munge_sdp(self, sdp: str):
         sdp_text = sdp
         # rtx-time needs to be set to 125 milliseconds for optimal performance
@@ -634,7 +681,7 @@ class RTCApp:
 
         # Assign event handlers for the input data channel
         data_channel.on("open", self.on_data_open)
-        data_channel.on("message", lambda msg: asyncio.run_coroutine_threadsafe(self.on_data_message(msg), loop=self.async_event_loop))
+        data_channel.on("message", lambda msg, cid=client_peer_id: asyncio.run_coroutine_threadsafe(self.handle_input_data_message(msg, cid), loop=self.async_event_loop))
 
         # A dynamic secondary data channel intended for file data transmission
         peer_connection.on("datachannel", lambda ch, cid=client_peer_id: self.on_datachannel(ch, cid))

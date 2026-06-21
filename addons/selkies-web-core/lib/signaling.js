@@ -214,10 +214,12 @@ export class WebRTCDemoSignaling {
     _onServerOpen() {
         // Send local device resolution and scaling with HELLO message.
         this.state = 'connected';
+        const shinto = window.SHINTO_SELKIES || {};
         const meta = {
             'client_type': this.client_type,
             'client_slot': this.client_slot,
             'client_strict_viewer': this.client_strict_viewer,
+            'shinto_controller_lease_generation': shinto.controllerLeaseGeneration || null,
         }
         this._ws_conn.send(`HELLO ${this.peer_type} ${JSON.stringify(meta)}`);
         this._setStatus("Registering with server, peer type: " + this.peer_type + ", client type: " + this.client_type);

@@ -18,6 +18,10 @@ from .webrtc_utils import generate_rtc_config, _is_trusted_config_file
 logger = logging.getLogger("signaling")
 
 
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class Peer:
     """Represents a connected WebSocket peer."""
@@ -67,6 +71,7 @@ class WebRTCPeerManagement:
         self.enable_player3: bool = options.enable_player3
         self.enable_player4: bool = options.enable_player4
         self.lock: asyncio.Lock = asyncio.Lock()
+        self.shinto_persistent_session: bool = _truthy_env("SHINTO_PERSISTENT_SESSION")
 
         # RTC config - can be str or dict. Apply the same ownership/permission
         # checks as webrtc_utils.try_json_file(): this content is served verbatim
@@ -156,6 +161,15 @@ class WebRTCPeerManagement:
 
             if not peer:
                 return
+
+            if self.shinto_persistent_session and peer.client_type in ("controller", "viewer"):
+                logger.info(
+                    "Shinto persistent session retained server peer after {} disconnect, client type {!r}".format(
+                        uid, peer.client_type
+                    )
+                )
+                return
+
             # if controller closes the connection also close server side connection
             if peer.client_type == "controller":
                 other_peer = self.peers.get(other_id)
