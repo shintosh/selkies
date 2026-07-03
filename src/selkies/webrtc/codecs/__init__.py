@@ -129,7 +129,7 @@ def init_codecs() -> None:
         dynamic_pt += 2
 
     add_video_codec("video/VP8")
-    for profile_level_id in ("42001f", "42e01f"):
+    for profile_level_id in ("42e01f", "42001f"):
         add_video_codec(
             "video/H264",
             {

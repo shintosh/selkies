@@ -21,6 +21,8 @@
 
 import logging
 import asyncio
+import os
+import time
 import re
 import json
 import base64
@@ -99,6 +101,21 @@ class ClientType(str, Enum):
 class RTCAppError(Exception):
     pass
 
+def _shinto_truthy_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+SHINTO_IDR_REQUEST_MIN_INTERVAL_SECONDS = 2.0
+
+
+def _shinto_monotonic_seconds() -> float:
+    return time.monotonic()
+
+
+
 class PipelineBridge:
     """A bridge to asynchronously pass data between Media and the RTC pipeline"""
     def __init__(self):
@@ -152,6 +169,9 @@ class RTCApp:
         self.turn_servers = turn_servers
         self.encoder = encoder
         self.last_cursor_sent = None
+        self.shinto_audio_enabled = _shinto_truthy_env("SHINTO_SELKIES_AUDIO_ENABLED", default=True)
+        self.shinto_last_idr_request_at = 0.0
+        self.shinto_suppressed_pli_count = 0
 
         self.audio_pipeline_bridge = None
         self.video_pipeline_bridge = None
@@ -372,16 +392,6 @@ class RTCApp:
             logger.info("skipping message because data channel is not ready: %s" % msg_type)
             return
 
-        msg = {"type": msg_type, "data": data}
-        data_channel.send(json.dumps(msg))
-
-    def send_media_data_over_channel(self, msg_type, data):
-        self.__send_data_channel_message(msg_type, data)
-
-    def get_controller_instance(self):
-        """Returns the peer connection object for the controller client, if it exists."""
-        return next((obj for obj in self.peer_connections.values() if obj.get("client_type") == ClientType.CONTROLLER), None)
-
     def should_accept_input(self, client_peer_id: str) -> bool:
         """Returns true only for the current controller peer."""
         peer_obj = self.peer_connections.get(client_peer_id)
@@ -428,6 +438,33 @@ class RTCApp:
             "connection_states": connection_states,
             "data_channel_states": data_channel_states,
         }
+
+        msg = {"type": msg_type, "data": data}
+        data_channel.send(json.dumps(msg))
+
+    def send_media_data_over_channel(self, msg_type, data):
+        self.__send_data_channel_message(msg_type, data)
+
+    def get_controller_instance(self):
+        """Returns the ready controller peer, if one exists."""
+        fallback = None
+        for peer_obj in self.peer_connections.values():
+            if peer_obj.get("client_type") != ClientType.CONTROLLER:
+                continue
+            if fallback is None:
+                fallback = peer_obj
+            peer_conn = peer_obj.get("peer_conn")
+            data_channel = peer_obj.get("data_channel")
+            conn_state = getattr(peer_conn, "connectionState", "unknown") or "unknown"
+            data_channel_state = getattr(data_channel, "readyState", "unknown") or "unknown"
+            if conn_state == "connected" and data_channel_state == "open":
+                return peer_obj
+        if fallback is not None:
+            logger.info(
+                "using retained controller fallback because no ready controller data channel exists"
+            )
+        return fallback
+
 
     def munge_sdp(self, sdp: str):
         sdp_text = sdp
@@ -646,7 +683,24 @@ class RTCApp:
             logger.debug(f"Unhandled peer connection state: {state}", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
 
     def on_pli(self, client_peer_id: str, client_type: str):
-        logger.info("PLI occurred, triggering IDR frame request", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
+        now = _shinto_monotonic_seconds()
+        last_idr = getattr(self, "shinto_last_idr_request_at", 0.0)
+        if now - last_idr < SHINTO_IDR_REQUEST_MIN_INTERVAL_SECONDS:
+            self.shinto_suppressed_pli_count = getattr(self, "shinto_suppressed_pli_count", 0) + 1
+            if self.shinto_suppressed_pli_count == 1 or self.shinto_suppressed_pli_count % 30 == 0:
+                logger.info(
+                    "PLI occurred, suppressing IDR frame request due to Shinto rate limit",
+                    extra={'client_peer_id': client_peer_id, 'client_type': client_type}
+                )
+            return
+
+        suppressed_count = getattr(self, "shinto_suppressed_pli_count", 0)
+        self.shinto_suppressed_pli_count = 0
+        self.shinto_last_idr_request_at = now
+        logger.info(
+            f"PLI occurred, triggering IDR frame request; suppressed_since_last_idr={suppressed_count}",
+            extra={'client_peer_id': client_peer_id, 'client_type': client_type}
+        )
         asyncio.run_coroutine_threadsafe(self.request_idr_frame(), self.async_event_loop)
 
     async def _start_rtc_pipeline(self, client_peer_id: str, c_type: str):
@@ -662,8 +716,11 @@ class RTCApp:
             self.video_pipeline_bridge = PipelineBridge()
             self.video_media = VideoMedia(self.video_pipeline_bridge)
 
-            self.audio_pipeline_bridge = PipelineBridge()
-            self.audio_media = AudioMedia(self.audio_pipeline_bridge)
+            if self.shinto_audio_enabled:
+                self.audio_pipeline_bridge = PipelineBridge()
+                self.audio_media = AudioMedia(self.audio_pipeline_bridge)
+            else:
+                logger.info("skipping audio signalling peer because SHINTO_SELKIES_AUDIO_ENABLED=false")
             logger.info("Media relay and pipeline bridges created for controller client")
 
         peer_connection =  RTCPeerConnection(self.get_rtc_config())
@@ -674,7 +731,8 @@ class RTCApp:
         # add audio and video encoded streams
         rtp_video_sender = peer_connection.addTrack(self.media_relay.subscribe(self.video_media))
         rtp_video_sender.on("pli", lambda cid=client_peer_id, ct=client_type: self.on_pli(cid, ct))
-        peer_connection.addTrack(self.media_relay.subscribe(self.audio_media))
+        if self.shinto_audio_enabled:
+            peer_connection.addTrack(self.media_relay.subscribe(self.audio_media))
 
         # Primary data channel
         data_channel = peer_connection.createDataChannel("input", ordered=True, maxRetransmits=0)

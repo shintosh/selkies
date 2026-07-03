@@ -19,6 +19,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+import os
 import asyncio
 import logging
 import ctypes
@@ -32,6 +33,92 @@ from pcmflux import AudioCapture, AudioCaptureSettings, AudioChunkCallback
 
 logger = logging.getLogger("media_pipeline")
 logger.setLevel(logging.INFO)
+
+
+
+def _shinto_max_video_bitrate_kbps() -> int:
+    raw = os.environ.get("SELKIES_MAX_VIDEO_BITRATE", "300").strip()
+    if raw == "":
+        raw = "300"
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            f"invalid SELKIES_MAX_VIDEO_BITRATE={raw!r}; using 300 kbps"
+        )
+        return 300
+
+
+def _shinto_video_bitrate_target_kbps(new_bitrate: int) -> int:
+    """Return the exact pixelflux kbps target for Selkies bitrate updates.
+
+    Selkies starts with an integer Mbps setting, but the bundled web client
+    sends kbps-style values (`300` means 300 kbps). Preserve both contracts:
+    values below 100 are legacy Mbps, values 100+ are client kbps.
+    """
+    if new_bitrate <= 0:
+        return new_bitrate
+    target_kbps = new_bitrate * 1000 if new_bitrate < 100 else new_bitrate
+    max_kbps = _shinto_max_video_bitrate_kbps()
+    if max_kbps > 0 and target_kbps > max_kbps:
+        # Build-time assertions inspect this clamp path as the CPU budget guard.
+        logger.info(
+            f"clamping video bitrate: {target_kbps}kbps to {max_kbps}kbps "
+            f"(SELKIES_MAX_VIDEO_BITRATE={max_kbps}kbps)"
+        )
+        target_kbps = max_kbps
+    return target_kbps
+
+
+def _shinto_h264_nal_starts(buf: bytes):
+    offset = 0
+    while True:
+        start_code = buf.find(b"\x00\x00\x01", offset)
+        if start_code < 0:
+            return
+        nal_start = start_code + 3
+        if start_code > 0 and buf[start_code - 1] == 0:
+            nal_start = start_code + 3
+        yield nal_start
+        offset = nal_start
+
+
+def _shinto_h264_first_sps_profile_level_id(buf: bytes):
+    for nal_start in _shinto_h264_nal_starts(buf):
+        if nal_start + 4 > len(buf):
+            continue
+        if (buf[nal_start] & 0x1F) == 7:
+            return buf[nal_start + 1 : nal_start + 4].hex()
+    return None
+
+
+def _shinto_normalize_h264_sps_for_chrome(buf: bytes) -> bytes:
+    """Normalize pixelflux x264 constrained-baseline SPS for Chrome WebRTC.
+
+    x264's baseline encoder emits profile-iop 0xc0 for level-3.1 output, while
+    Chromium negotiates constrained-baseline as profile-level-id=42e01f. Only
+    rewrite level-3.1-or-lower baseline SPS headers; do not mask over 3.2/4.2
+    streams, because those must be fixed by encoder defaults instead.
+    """
+    normalized = None
+    for nal_start in _shinto_h264_nal_starts(buf):
+        if nal_start + 4 > len(buf):
+            continue
+        if (buf[nal_start] & 0x1F) != 7:
+            continue
+        profile_idc = buf[nal_start + 1]
+        profile_iop = buf[nal_start + 2]
+        level_idc = buf[nal_start + 3]
+        if profile_idc != 0x42 or level_idc > 0x1F:
+            continue
+        if (profile_iop & 0xE0) != 0xC0:
+            continue
+        if normalized is None:
+            normalized = bytearray(buf)
+        normalized[nal_start + 2] = 0xE0
+    if normalized is None:
+        return buf
+    return bytes(normalized)
 
 
 class RateControlMode(str, Enum):
@@ -126,6 +213,8 @@ class MediaPipelinePixel(MediaPipeline):
         self.capture_module = None
         self.pcmflux_module = None
         self._is_screen_capturing = False
+        self._shinto_video_bitrate_kbps = _shinto_video_bitrate_target_kbps(int(video_bitrate))
+        self._shinto_logged_h264_sps_profile = False
         self._is_pcmflux_capturing = False
         self._running = False
         self.async_lock = asyncio.Lock()
@@ -200,21 +289,22 @@ class MediaPipelinePixel(MediaPipeline):
         if not self._is_screen_capturing or self.capture_module is None:
             return
 
-        if (
-            self.rc_mode == RateControlMode.CRF
-            or new_bitrate <= 0
-            or self.video_bitrate == new_bitrate
-        ):
+        target_kbps = _shinto_video_bitrate_target_kbps(new_bitrate)
+        current_kbps = getattr(
+            self, "_shinto_video_bitrate_kbps", int(self.video_bitrate) * 1000
+        )
+        if self.rc_mode == RateControlMode.CRF or target_kbps <= 0 or current_kbps == target_kbps:
             return
 
         try:
             await self.async_event_loop.run_in_executor(
-                None, self.capture_module.update_video_bitrate, new_bitrate * 1000
+                None, self.capture_module.update_video_bitrate, target_kbps
             )
             logger.info(
-                f"Updated video bitrate: {self.video_bitrate}Mbps -> {new_bitrate}Mbps"
+                f"Updated video bitrate: {current_kbps}kbps -> {target_kbps}kbps"
             )
-            self.video_bitrate = new_bitrate
+            self._shinto_video_bitrate_kbps = target_kbps
+            self.video_bitrate = max(1, (target_kbps + 999) // 1000)
         except AttributeError:
             logger.error("Video capture module does not support video bitrate updation")
         except Exception as e:
@@ -294,7 +384,7 @@ class MediaPipelinePixel(MediaPipeline):
             cs.h264_crf = self.h264_crf
             # Setting h264_cbr_mode to True will make the encoder ignore the crf value
             cs.h264_cbr_mode = self.rc_mode == RateControlMode.CBR
-            cs.h264_bitrate_kbps = self.video_bitrate * 1000  # Convert Mbps to kbps
+            cs.h264_bitrate_kbps = self._shinto_video_bitrate_kbps
             cs.vaapi_render_node_index = -1
             if self.encoder_rtc == "x264enc":
                 cs.use_cpu = True
@@ -312,7 +402,14 @@ class MediaPipelinePixel(MediaPipeline):
             try:
                 result = result_ptr.contents
                 if result.size > 0:
-                    data_bytes = bytes(result.data[10 : result.size])
+                    data_bytes = _shinto_normalize_h264_sps_for_chrome(bytes(result.data[10 : result.size]))
+                    if not self._shinto_logged_h264_sps_profile:
+                        profile_level_id = _shinto_h264_first_sps_profile_level_id(data_bytes)
+                        if profile_level_id:
+                            logger.info(
+                                f"pixelflux h264 SPS profile-level-id: {profile_level_id}"
+                            )
+                            self._shinto_logged_h264_sps_profile = True
                     if not hasattr(result, "frame_id"):
                         logger.error(
                             f"Missing frame_id from screen capture result, skipping frame"

@@ -33,11 +33,13 @@
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from aioice import Candidate, Connection, ConnectionClosed
+import aioice.ice as aioice_ice
+from aioice import Candidate, Connection as AioIceConnection, ConnectionClosed
 from pyee.asyncio import AsyncIOEventEmitter
 
 from .exceptions import InvalidStateError
@@ -206,6 +208,134 @@ def parse_stun_turn_uri(uri: str) -> dict[str, Any]:
     return parsed
 
 
+def _shinto_port_env(name: str) -> Optional[int]:
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return None
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if port < 1 or port > 65535:
+        raise ValueError(f"{name} must be between 1 and 65535")
+    return port
+
+
+def _shinto_local_port_range() -> Optional[range]:
+    min_port = _shinto_port_env("SELKIES_MIN_RTP_PORT")
+    max_port = _shinto_port_env("SELKIES_MAX_RTP_PORT")
+    if min_port is None and max_port is None:
+        return None
+    if min_port is None or max_port is None:
+        raise ValueError("SELKIES_MIN_RTP_PORT and SELKIES_MAX_RTP_PORT must be set together")
+    if min_port > max_port:
+        raise ValueError("SELKIES_MIN_RTP_PORT must be less than or equal to SELKIES_MAX_RTP_PORT")
+    return range(min_port, max_port + 1)
+
+
+class ShintoBoundPortConnection(AioIceConnection):
+    _shinto_bounded_rtp_ports = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._shinto_local_port_range = _shinto_local_port_range()
+        self._shinto_next_port_index = 0
+        if self._shinto_local_port_range is not None:
+            logger.info(
+                "Shinto bounded RTP local port range configured: %s-%s",
+                self._shinto_local_port_range.start,
+                self._shinto_local_port_range.stop - 1,
+            )
+
+    async def _shinto_create_host_endpoint(self, loop: Any, address: str) -> Any:
+        if self._shinto_local_port_range is None:
+            return await loop.create_datagram_endpoint(
+                lambda: aioice_ice.StunProtocol(self), local_addr=(address, 0)
+            )
+
+        last_error = None
+        ports = self._shinto_local_port_range
+        for offset in range(len(ports)):
+            index = (self._shinto_next_port_index + offset) % len(ports)
+            port = ports[index]
+            try:
+                transport, protocol = await loop.create_datagram_endpoint(
+                    lambda: aioice_ice.StunProtocol(self), local_addr=(address, port)
+                )
+            except OSError as exc:
+                last_error = exc
+                continue
+            self._shinto_next_port_index = (index + 1) % len(ports)
+            return transport, protocol
+        if last_error is not None:
+            raise last_error
+        raise OSError("no ports available in Shinto bounded RTP range")
+
+    async def get_component_candidates(
+        self, component: int, addresses: list[str], timeout: int = 5
+    ) -> list[Candidate]:
+        candidates = []
+        loop = asyncio.get_event_loop()
+
+        host_protocols = []
+        for address in addresses:
+            try:
+                transport, protocol = await self._shinto_create_host_endpoint(loop, address)
+                sock = transport.get_extra_info("socket")
+                if sock is not None:
+                    sock.setsockopt(
+                        aioice_ice.socket.SOL_SOCKET,
+                        aioice_ice.socket.SO_RCVBUF,
+                        aioice_ice.turn.UDP_SOCKET_BUFFER_SIZE,
+                    )
+            except OSError as exc:
+                self._Connection__log_info("Could not bind to %s - %s", address, exc)
+                continue
+            host_protocols.append(protocol)
+
+            candidate_address = protocol.transport.get_extra_info("sockname")
+            protocol.local_candidate = Candidate(
+                foundation=aioice_ice.candidate_foundation("host", "udp", candidate_address[0]),
+                component=component,
+                transport="udp",
+                priority=aioice_ice.candidate_priority(component, "host"),
+                host=candidate_address[0],
+                port=candidate_address[1],
+                type="host",
+            )
+            if self._transport_policy == aioice_ice.TransportPolicy.ALL:
+                candidates.append(protocol.local_candidate)
+        self._protocols += host_protocols
+
+        tasks: list[asyncio.Task[tuple[Candidate, Optional[aioice_ice.StunProtocol]]]] = []
+        if self.stun_server:
+            for protocol in host_protocols:
+                if aioice_ice.ipaddress.ip_address(protocol.local_candidate.host).version == 4:
+                    tasks.append(asyncio.create_task(aioice_ice.server_reflexive_candidate(protocol, self.stun_server)))
+        if self.turn_server:
+            tasks.append(asyncio.create_task(aioice_ice.relayed_candidate(
+                component=component,
+                protocol_factory=lambda: aioice_ice.StunProtocol(self),
+                turn_server=self.turn_server,
+                turn_username=self.turn_username,
+                turn_password=self.turn_password,
+                turn_ssl=self.turn_ssl,
+                turn_transport=self.turn_transport,
+            )))
+
+        if len(tasks):
+            done, pending = await asyncio.wait(tasks, timeout=timeout)
+            for task in done:
+                if task.exception() is None:
+                    candidate, protocol = task.result()
+                    candidates.append(candidate)
+                    if protocol:
+                        self._protocols.append(protocol)
+            for task in pending:
+                task.cancel()
+        return candidates
+
+
 class RTCIceGatherer(AsyncIOEventEmitter):
     """
     The :class:`RTCIceGatherer` interface gathers local host, server reflexive
@@ -226,7 +356,7 @@ class RTCIceGatherer(AsyncIOEventEmitter):
             iceServers = self.getDefaultIceServers()
         ice_kwargs = connection_kwargs(iceServers)
 
-        self._connection = Connection(ice_controlling=False, **ice_kwargs)
+        self._connection = ShintoBoundPortConnection(ice_controlling=False, **ice_kwargs)
         self._remote_candidates_end = False
         self.__state = "new"
 
