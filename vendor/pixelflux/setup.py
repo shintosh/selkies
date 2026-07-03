@@ -6,7 +6,6 @@ from pathlib import Path
 import setuptools
 from setuptools import setup
 from setuptools.command.build_ext import build_ext
-from setuptools_rust import Binding, RustExtension, Strip
 
 if "RUSTFLAGS" not in os.environ:
     machine = platform.machine()
@@ -16,7 +15,6 @@ if "RUSTFLAGS" not in os.environ:
 
 class BuildCtypesExt(build_ext):
     def run(self):
-        super().run()
         self.build_custom_cpp()
 
     def build_custom_cpp(self):
@@ -78,16 +76,8 @@ setup(
     url="https://github.com/linuxserver/pixelflux",
     packages=setuptools.find_packages(),
     
-    rust_extensions=[
-        RustExtension(
-            "pixelflux.pixelflux_wayland", 
-            "pixelflux_wayland/Cargo.toml",
-            binding=Binding.PyO3,
-            debug=False,
-            strip=Strip.All
-        )
-    ],
-    
+    ext_modules=[setuptools.Extension("pixelflux.screen_capture_module", sources=[])],
+
     cmdclass={
        "build_ext": BuildCtypesExt,
     },
