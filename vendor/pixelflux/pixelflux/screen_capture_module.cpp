@@ -3493,8 +3493,15 @@ StripeEncodeResult encode_stripe_h264(
         param.i_width = capture_width_actual;
         param.i_height = stripe_height;
         param.i_csp = target_x264_csp;
+        // Shinto serves this CPU x264 path through browser WebRTC. Chrome
+        // negotiates constrained-baseline level 3.1 for H.264, and at 720p60
+        // x264's automatic level selection emits level 3.2 SPS headers, so
+        // the level is pinned to 3.1 regardless of the rate-control fps hint.
+        // Capture cadence follows the runtime update_framerate value (10-60).
+        // Runtime assertions also verify the matching H.264 SPS normalizer.
         param.i_fps_num = 60;
         param.i_fps_den = 1;
+        param.i_level_idc = 31;
         param.i_keyint_max = X264_KEYINT_MAX_INFINITE;
         param.b_repeat_headers = 1;
         param.b_annexb = 1;
