@@ -889,6 +889,7 @@ class WebRTCService(BaseStreamingService):
         )
         main_router.add_get(f"{api_prefix}/ws", self.rtc_ws_handler)
         main_router.add_get(f"{api_prefix}/turn", self.handle_turn_req)
+        main_router.add_get(f"{api_prefix}/shinto/server-ready", self.handle_server_ready)
         
         if self.args.enable_metrics_http:
             main_router.add_get(f"{api_prefix}/metrics", self.handle_metrics)
@@ -909,6 +910,17 @@ class WebRTCService(BaseStreamingService):
         if self.supervisor.current_mode != self.mode:
             return web.json_response({"error": "WebRTC mode is inactive"}, status=409)
         return await self.peer_manager.handle_turn_req(request)
+
+    async def handle_server_ready(self, request: web.Request) -> web.Response:
+        """Report whether the internal WebRTC server peer is registered."""
+        if self.supervisor.current_mode != self.mode:
+            return web.json_response(
+                {"server_ready": False, "error": "WebRTC mode is inactive"},
+                status=409,
+            )
+        ready = bool(self.peer_manager and self.peer_manager.has_server_peer())
+        status = 200 if ready else 503
+        return web.json_response({"server_ready": ready}, status=status)
 
     async def handle_metrics(self, request: web.Request) -> web.Response:
         """Handle metrics endpoint with mode validation"""

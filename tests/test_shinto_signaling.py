@@ -68,6 +68,29 @@ def make_peer(uid, ws, peer_type, client_type=None):
 
 
 class ShintoPersistentSessionTests(unittest.IsolatedAsyncioTestCase):
+    def test_server_peer_readiness_tracks_registered_server_peer(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            manager = WebRTCPeerManagement(FakeOptions())
+
+        self.assertFalse(manager.has_server_peer())
+
+        server_ws = FakeWebSocket()
+        manager.peers = {
+            "client-1": make_peer("client-1", FakeWebSocket(), "client", "controller"),
+            "server-1": make_peer("server-1", server_ws, "server"),
+        }
+
+        self.assertTrue(manager.has_server_peer())
+
+        server_ws.closed = True
+        self.assertFalse(manager.has_server_peer())
+
+    def test_server_peer_readiness_route_is_registered(self):
+        source = (SRC / "selkies" / "webrtc_mode.py").read_text()
+
+        self.assertIn('add_get(f"{api_prefix}/shinto/server-ready"', source)
+        self.assertIn("handle_server_ready", source)
+
     async def test_persistent_session_retains_server_when_controller_disconnects(self):
         with mock.patch.dict(os.environ, {"SHINTO_PERSISTENT_SESSION": "1"}):
             manager = WebRTCPeerManagement(FakeOptions())

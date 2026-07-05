@@ -119,6 +119,16 @@ class WebRTCPeerManagement:
         """
         self.rtc_config = rtc_config
 
+    def has_server_peer(self) -> bool:
+        """Return whether a live server peer is registered."""
+        for peer in self.peers.values():
+            if peer.peer_type != "server":
+                continue
+            if getattr(peer.ws, "closed", False):
+                continue
+            return True
+        return False
+
     async def recv_msg_ping(
         self, ws: WebSocketResponse, raddr: Tuple[str, int]
     ) -> WSMessage:
