@@ -172,6 +172,7 @@ class WebRTCPeerManagement:
 
             if self.shinto_persistent_session and peer.client_type == "controller":
                 logger.info("Shinto persistent session removed disconnected controller peer")
+                return
 
             # if controller closes the connection also close server side connection
             if peer.client_type == "controller":
