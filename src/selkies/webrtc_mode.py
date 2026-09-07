@@ -281,7 +281,7 @@ class WebRTCService(BaseStreamingService):
             enable_player3=self.args.enable_player3,
             enable_player4=self.args.enable_player4,
         )
-        self.peer_manager = WebRTCPeerManagement(options)
+        self.peer_manager = WebRTCPeerManagement(options, close_peer=self.rtc_app._stop_rtc_pipeline)
 
     def setup_callbacks(self) -> None:
         """Configure all application callbacks."""
@@ -897,7 +897,8 @@ class WebRTCService(BaseStreamingService):
     async def rtc_ws_handler(self, request: web.Request) -> web.WebSocketResponse:
         if self.supervisor.current_mode != self.mode:
             return web.Response(status=409, text="WebRTC mode is inactive")
-        ws = web.WebSocketResponse()
+        # A close acknowledgement follows exact RTC cleanup in remove_peer.
+        ws = web.WebSocketResponse(autoclose=False)
         await ws.prepare(request)
 
         peername = request.transport.get_extra_info("peername")
@@ -920,7 +921,7 @@ class WebRTCService(BaseStreamingService):
             )
         ready = bool(self.peer_manager and self.peer_manager.has_server_peer())
         status = 200 if ready else 503
-        return web.json_response({"server_ready": ready}, status=status)
+        return web.json_response({"server_ready": ready, "peer_close_contract": "selkies-peer-close/v1"}, status=status)
 
     async def handle_metrics(self, request: web.Request) -> web.Response:
         """Handle metrics endpoint with mode validation"""

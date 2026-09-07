@@ -39,7 +39,7 @@ class Peer:
 class WebRTCPeerManagement:
     """Manages WebRTC peer connections and signaling."""
 
-    def __init__(self, options: Any):
+    def __init__(self, options: Any, close_peer=None):
         # Format: {uid: Peer_object}
         self.peers: Dict[str, Peer] = {}
         # Format: {caller_uid: callee_uid}
@@ -71,7 +71,10 @@ class WebRTCPeerManagement:
         self.enable_player3: bool = options.enable_player3
         self.enable_player4: bool = options.enable_player4
         self.lock: asyncio.Lock = asyncio.Lock()
+        self.close_peer = close_peer
         self.shinto_persistent_session: bool = _truthy_env("SHINTO_PERSISTENT_SESSION")
+        if self.shinto_persistent_session and not callable(close_peer):
+            raise ValueError("persistent session requires exact peer closure")
 
         # RTC config - can be str or dict. Apply the same ownership/permission
         # checks as webrtc_utils.try_json_file(): this content is served verbatim
@@ -160,8 +163,10 @@ class WebRTCPeerManagement:
         """
         if uid in self.sessions:
             other_id = self.sessions[uid]
-            del self.sessions[uid]
             peer = self.peers.get(uid)
+            if self.shinto_persistent_session and peer and peer.client_type in ("controller", "viewer"):
+                await self.close_peer(uid)
+            del self.sessions[uid]
             client_type = peer.client_type if peer else "unknown"
             logger.info(
                 "Cleaned up {} session, client type {!r}".format(
@@ -172,16 +177,8 @@ class WebRTCPeerManagement:
             if not peer:
                 return
 
-            if self.shinto_persistent_session and peer.client_type == "viewer":
-                logger.info(
-                    "Shinto persistent session retained server peer after {} disconnect, client type {!r}".format(
-                        uid, peer.client_type
-                    )
-                )
-                return
-
-            if self.shinto_persistent_session and peer.client_type == "controller":
-                logger.info("Shinto persistent session removed disconnected controller peer")
+            if self.shinto_persistent_session and peer.client_type in ("controller", "viewer"):
+                logger.info("Shinto persistent session closed disconnected peer")
                 return
 
             # if controller closes the connection also close server side connection
@@ -230,7 +227,7 @@ class WebRTCPeerManagement:
             logger.info("room {}: {} -> {}: {}".format(room_id, uid, pid, msg))
             await wsp.send_str(msg)
 
-    async def remove_peer(self, uid: str) -> None:
+    async def remove_peer(self, uid: str, close_code: int = 1000) -> None:
         """Remove a peer and clean up associated resources.
         Args:
             uid: Peer ID to remove
@@ -259,7 +256,7 @@ class WebRTCPeerManagement:
                             )
                 else:
                     del self.peers[uid]
-                    await ws.close(code=1000, message=b"Connection closed")
+                    await ws.close(code=close_code, message=b"Connection closed")
                     logger.info(
                         "Disconnected from peer {!r} at {!r} of client_type {!r}".format(
                             uid, raddr, client_type
@@ -631,6 +628,7 @@ class WebRTCPeerManagement:
             logger.error(f"Error during handshake with peer {raddr}: {e}")
             return
 
+        close_code = 1000
         try:
             await self.peer_connection_handler(
                 ws,
@@ -646,10 +644,10 @@ class WebRTCPeerManagement:
                 "Error in connection handler for peer {!r}: {}".format(raddr, e),
                 exc_info=True,
             )
-            await ws.close(code=1002, message=b"internal error")
+            close_code = 1002
         finally:
             if peer_id:
-                await self.remove_peer(peer_id)
+                await self.remove_peer(peer_id, close_code=close_code)
 
     async def handle_turn_req(self, request: web.Request) -> web.Response:
         """

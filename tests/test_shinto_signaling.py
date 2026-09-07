@@ -70,7 +70,7 @@ def make_peer(uid, ws, peer_type, client_type=None):
 class ShintoPersistentSessionTests(unittest.IsolatedAsyncioTestCase):
     def test_server_peer_readiness_tracks_registered_server_peer(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            manager = WebRTCPeerManagement(FakeOptions())
+            manager = WebRTCPeerManagement(FakeOptions(), close_peer=mock.AsyncMock())
 
         self.assertFalse(manager.has_server_peer())
 
@@ -93,7 +93,7 @@ class ShintoPersistentSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_persistent_session_retains_server_when_controller_disconnects(self):
         with mock.patch.dict(os.environ, {"SHINTO_PERSISTENT_SESSION": "1"}):
-            manager = WebRTCPeerManagement(FakeOptions())
+            manager = WebRTCPeerManagement(FakeOptions(), close_peer=mock.AsyncMock())
 
         controller_ws = FakeWebSocket()
         server_ws = FakeWebSocket()
@@ -108,10 +108,11 @@ class ShintoPersistentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({}, manager.sessions)
         self.assertEqual([], server_ws.close_calls)
         self.assertFalse(server_ws.closed)
+        manager.close_peer.assert_awaited_once_with("client-1")
 
     async def test_persistent_session_does_not_send_viewer_session_end(self):
         with mock.patch.dict(os.environ, {"SHINTO_PERSISTENT_SESSION": "true"}):
-            manager = WebRTCPeerManagement(FakeOptions())
+            manager = WebRTCPeerManagement(FakeOptions(), close_peer=mock.AsyncMock())
 
         viewer_ws = FakeWebSocket()
         server_ws = FakeWebSocket()
@@ -124,10 +125,73 @@ class ShintoPersistentSessionTests(unittest.IsolatedAsyncioTestCase):
         await manager.cleanup_session("client-1")
 
         self.assertEqual([], server_ws.sent)
+        manager.close_peer.assert_awaited_once_with("client-1")
+
+    async def test_peer_cleanup_joins_exact_rtc_closure(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        closed = []
+
+        async def close_peer(uid):
+            entered.set()
+            await release.wait()
+            closed.append(uid)
+
+        with mock.patch.dict(os.environ, {"SHINTO_PERSISTENT_SESSION": "1"}):
+            manager = WebRTCPeerManagement(FakeOptions(), close_peer=close_peer)
+        current_ws, other_ws, server_ws = FakeWebSocket(), FakeWebSocket(), FakeWebSocket()
+        manager.peers = {
+            "client-1": make_peer("client-1", current_ws, "client", "controller"),
+            "client-2": make_peer("client-2", other_ws, "client", "viewer"),
+            "server-1": make_peer("server-1", server_ws, "server"),
+        }
+        manager.sessions = {"client-1": "server-1", "client-2": "server-1"}
+        cleanup = asyncio.create_task(manager.remove_peer("client-1"))
+        try:
+            await entered.wait()
+            self.assertFalse(cleanup.done())
+            self.assertFalse(current_ws.closed)
+        finally:
+            release.set()
+            await cleanup
+        self.assertEqual(["client-1"], closed)
+        self.assertTrue(current_ws.closed)
+        self.assertFalse(other_ws.closed)
+        self.assertFalse(server_ws.closed)
+        self.assertEqual({"client-2": "server-1"}, manager.sessions)
+
+    async def test_failed_peer_cleanup_retains_session_for_retry(self):
+        permit_close = False
+
+        async def close_peer(uid):
+            if not permit_close:
+                raise RuntimeError("RTC closure failed")
+
+        with mock.patch.dict(os.environ, {"SHINTO_PERSISTENT_SESSION": "1"}):
+            manager = WebRTCPeerManagement(FakeOptions(), close_peer=close_peer)
+        client_ws, server_ws = FakeWebSocket(), FakeWebSocket()
+        manager.peers = {
+            "client-1": make_peer("client-1", client_ws, "client", "controller"),
+            "server-1": make_peer("server-1", server_ws, "server"),
+        }
+        manager.sessions = {"client-1": "server-1"}
+
+        with self.assertRaisesRegex(RuntimeError, "RTC closure failed"):
+            await manager.remove_peer("client-1")
+        self.assertFalse(client_ws.closed)
+        self.assertFalse(server_ws.closed)
+        self.assertIn("client-1", manager.peers)
+        self.assertEqual({"client-1": "server-1"}, manager.sessions)
+
+        permit_close = True
+        await manager.remove_peer("client-1")
+        self.assertTrue(client_ws.closed)
+        self.assertFalse(server_ws.closed)
+        self.assertNotIn("client-1", manager.peers)
+        self.assertEqual({}, manager.sessions)
 
     async def test_default_controller_disconnect_closes_server(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            manager = WebRTCPeerManagement(FakeOptions())
+            manager = WebRTCPeerManagement(FakeOptions(), close_peer=mock.AsyncMock())
 
         controller_ws = FakeWebSocket()
         server_ws = FakeWebSocket()
