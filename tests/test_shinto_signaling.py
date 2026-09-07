@@ -147,7 +147,7 @@ class ShintoPersistentSessionTests(unittest.IsolatedAsyncioTestCase):
         manager.sessions = {"client-1": "server-1", "client-2": "server-1"}
         cleanup = asyncio.create_task(manager.remove_peer("client-1"))
         try:
-            await entered.wait()
+            await asyncio.wait_for(entered.wait(), 5)
             self.assertFalse(cleanup.done())
             self.assertFalse(current_ws.closed)
         finally:

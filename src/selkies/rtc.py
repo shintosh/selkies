@@ -750,18 +750,26 @@ class RTCApp:
             raise RTCAppError(f"Encoder {self.encoder} is not supported")
         self.force_codec(peer_connection, rtp_video_sender, preferred_codec)
 
-        await peer_connection.setLocalDescription(await peer_connection.createOffer())
-        offer = peer_connection.localDescription
-
-        sdp = offer.sdp
-        sdp = self.munge_sdp(sdp)
-        await self.on_sdp('offer', sdp, client_peer_id)
-
+        # Register before negotiation yields so signaling cleanup can close
+        # this exact connection while ICE or offer publication is pending.
         self.peer_connections[client_peer_id] = {
             "peer_conn": peer_connection,
             "data_channel": data_channel,
             "client_type": client_type
         }
+        try:
+            await peer_connection.setLocalDescription(await peer_connection.createOffer())
+            current = self.peer_connections.get(client_peer_id)
+            if not current or current.get("peer_conn") is not peer_connection or peer_connection.connectionState == "closed":
+                return
+            offer = peer_connection.localDescription
+            sdp = self.munge_sdp(offer.sdp)
+            await self.on_sdp('offer', sdp, client_peer_id)
+        except BaseException:
+            current = self.peer_connections.get(client_peer_id)
+            if current and current.get("peer_conn") is peer_connection:
+                await self._stop_rtc_pipeline(client_peer_id)
+            raise
 
     def get_mime_by_encoder(self, encoder: str) -> Optional[str]:
         """Returns respective mime type by encoder name"""

@@ -231,6 +231,10 @@ class WebRTCService(BaseStreamingService):
     async def handle_session_start(
         self, session_peer_id: str, client_type: str
     ) -> None:
+        peer = self.peer_manager.peers.get(session_peer_id)
+        if peer is None or peer.client_type != client_type or peer.ws.closed:
+            logger.info("Discarded session start for a disconnected signaling peer")
+            return
         logger.info(
             f"starting session for client peer id: {session_peer_id} of type: {client_type}"
         )

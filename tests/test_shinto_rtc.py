@@ -2,6 +2,7 @@ import asyncio
 import sys
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -77,6 +78,62 @@ class FakeDataChannel:
 class ShintoRTCTests(unittest.IsolatedAsyncioTestCase):
     def make_app(self):
         return RTCApp(asyncio.get_running_loop(), encoder="x264enc")
+
+    async def test_pending_offer_is_closed_without_late_registration(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        offers = []
+
+        class NegotiatingPeer:
+            connectionState = "new"
+
+            def on(self, event, callback):
+                pass
+
+            def addTrack(self, track):
+                self.sender = types.SimpleNamespace(track=track, on=self.on)
+                return self.sender
+
+            def createDataChannel(self, *args, **kwargs):
+                return types.SimpleNamespace(on=self.on)
+
+            def getTransceivers(self):
+                return [types.SimpleNamespace(sender=self.sender, setCodecPreferences=lambda codecs: None)]
+
+            async def createOffer(self):
+                entered.set()
+                await release.wait()
+                return types.SimpleNamespace(sdp="v=0\r\n")
+
+            async def setLocalDescription(self, offer):
+                self.localDescription = offer
+
+            async def close(self):
+                self.connectionState = "closed"
+
+        async def publish_offer(kind, sdp, peer_id):
+            offers.append(peer_id)
+
+        app = self.make_app()
+        app.shinto_audio_enabled = False
+        app.stun_servers, app.turn_servers = [], []
+        app.video_media = types.SimpleNamespace(kind="video")
+        app.media_relay = types.SimpleNamespace(subscribe=lambda track: track)
+        app.on_sdp = publish_offer
+        peer = NegotiatingPeer()
+        with mock.patch("selkies.rtc.RTCPeerConnection", return_value=peer), \
+             mock.patch("selkies.rtc.RTCConfiguration", side_effect=lambda **kwargs: kwargs), \
+             mock.patch("selkies.rtc.RTCRtpSender.getCapabilities", return_value=types.SimpleNamespace(codecs=[types.SimpleNamespace(mimeType="video/H264")])):
+            starting = asyncio.create_task(app._start_rtc_pipeline("pending-viewer", "viewer"))
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                await app._stop_rtc_pipeline("pending-viewer")
+                self.assertEqual("closed", peer.connectionState)
+            finally:
+                release.set()
+                await starting
+                await app._stop_rtc_pipeline("pending-viewer")
+        self.assertEqual({}, app.peer_connections)
+        self.assertEqual([], offers)
 
     async def test_should_accept_input_only_for_controller(self):
         app = self.make_app()
